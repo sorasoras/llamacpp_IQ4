@@ -313,6 +313,20 @@ void ggml_fp32_to_fp16_row(const float * x, ggml_fp16_t * y, int n) {
     }
 }
 
+#if defined(__AVX512BF16__) && defined(__AVX512VL__)
+void ggml_fp32_to_bf16_row(const float * x, ggml_bf16_t * y, int n) {
+    int i = 0;
+    for (; i < n / 16 * 16; i += 16) {
+        __m512 t0 = _mm512_loadu_ps(x + i);
+        __m256bh t1 = _mm512_cvtneps_pbh(t0);
+        _mm256_storeu_si256((__m256i *)(y + i), t1);
+    }
+    for (; i < n; i++) {
+        y[i] = _mm_cvtness_sbh(x[i]);
+    }
+}
+#endif
+
 //
 // timing
 //
@@ -9835,6 +9849,12 @@ static void ggml_compute_forward_mul_mat(
         if (params->type == GGML_TASK_INIT) {
             if (type != GGML_TYPE_F32) {
                 assert(params->wsize >= desired_wsize);
+
+#if defined(__AVX512BF16__) && defined(__AVX512VL__)
+                ggml_bf16_t * const x_bh_base = (ggml_bf16_t *) params->wdata + ne13*ne12*ne_plane*2;
+                ggml_bf16_t * const y_bh_base = (ggml_bf16_t *) params->wdata + ne13*ne12*ne_plane*3;
+#endif
+
                 // parallelize by src0 rows
                 for (int64_t i13 = 0; i13 < ne13; i13++) {
                     for (int64_t i12 = 0; i12 < ne12; i12++) {
@@ -9842,12 +9862,24 @@ static void ggml_compute_forward_mul_mat(
                         const int64_t i03 = i13/r3;
                         const int64_t i02 = i12/r2;
 
-                        const void           *       x        = (char *)  src0->data    + i02*nb02          + i03*nb03;
-                              float          * const wdata    = (float *) params->wdata + i13*ne12*ne_plane + i12*ne_plane;
+                        const void           *       x        = (char *)  src0->data           + i02*nb02          + i03*nb03;
+                              float          * const wdata    = (float *) params->wdata        + i13*ne12*ne_plane + i12*ne_plane;
                               ggml_to_float_t  const to_float = type_traits[type].to_float;
 
+#if defined(__AVX512BF16__) && defined(__AVX512VL__)
+                        const float          *       y        = (float *) ((char *) src1->data + i12*nb12          + i13*nb13);
+                              ggml_bf16_t    * const x_bh     =           x_bh_base            + i13*ne12*ne_plane + i12*ne_plane;
+                              ggml_bf16_t    * const y_bh     =           y_bh_base            + i13*ne12*ne_plane + i12*ne_plane;
+#endif
+
                         for (int64_t i01 = ith; i01 < ne01; i01+=nth) {
-                            to_float((const char *) x + i01*nb01, wdata + i01*ne00, ne00);
+                            to_float((const char *) x   + i01*nb01, wdata + i01*ne00, ne00);
+#if defined(__AVX512BF16__) && defined(__AVX512VL__)
+                            ggml_fp32_to_bf16_row(wdata + i01*ne00, x_bh  + i01*ne00, ne00);
+                        }
+                        for (int64_t i11 = ith; i11 < ne11; i11+=nth) {
+                            ggml_fp32_to_bf16_row(y + i11*ne10, y_bh + i11*ne10, ne10);
+#endif
                         }
                     }
                 }
@@ -9865,14 +9897,38 @@ static void ggml_compute_forward_mul_mat(
         }
 
         const int64_t tgemm0 = ggml_perf_time_us();
+#if defined(__AVX512BF16__) && defined(__AVX512VL__)
+        ggml_bf16_t * const x_bh_base = (ggml_bf16_t *) params->wdata + ne13*ne12*ne_plane*2;
+        ggml_bf16_t * const y_bh_base = (ggml_bf16_t *) params->wdata + ne13*ne12*ne_plane*3;
+#endif
         for (int64_t i13 = 0; i13 < ne13; i13++) {
             for (int64_t i12 = 0; i12 < ne12; i12++) {
                 const int64_t i03 = i13/r3;
                 const int64_t i02 = i12/r2;
 
+                float * d = (float *) ((char *) dst->data + i12*nb2 + i13*nb3);
+#if defined(__AVX512BF16__) && defined(__AVX512VL__)
+                if (type != GGML_TYPE_F32) {
+                    const ggml_bf16_t * x_bh = x_bh_base + i13*ne12*ne_plane + i12*ne_plane;
+                    const ggml_bf16_t * y_bh = y_bh_base + i13*ne12*ne_plane + i12*ne_plane;
+                    cblas_gemm_bf16bf16f32(CblasRowMajor, CblasNoTrans, CblasTrans,
+                             ne1, ne01, ne10,
+                            1.0f, y_bh, ne10,
+                                  x_bh, ne00,
+                            0.0f,    d, ne01);
+                }
+                else {
+                    const void  * x = (char *)            src0->data + i02*nb02 + i03*nb03;
+                    const float * y = (float *) ((char *) src1->data + i12*nb12 + i13*nb13);
+                    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                             ne1, ne01, ne10,
+                            1.0f,    y, ne10,
+                                     x, ne00,
+                            0.0f,    d, ne01);
+                }
+#else
                 const void  * x = (char *)            src0->data + i02*nb02 + i03*nb03;
                 const float * y = (float *) ((char *) src1->data + i12*nb12 + i13*nb13);
-                      float * d = (float *) ((char *)  dst->data + i12*nb2  + i13*nb3);
 
                 if (type != GGML_TYPE_F32) {
                     x = (float *) params->wdata + i13*ne12*ne_plane + i12*ne_plane;
@@ -9883,6 +9939,7 @@ static void ggml_compute_forward_mul_mat(
                          1.0f,    y, ne10,
                                   x, ne00,
                          0.0f,    d, ne01);
+#endif
             }
         }
         //printf("cblas_sgemm = %.3f ms, %lld flops\n", (ggml_perf_time_us() - tgemm0)/1000.0, ne13*ne12*ne1*ne01*ne10*2);
@@ -16799,7 +16856,16 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
                             // here we need memory just for single 2D matrix from src0
                             cur = ggml_type_size(GGML_TYPE_F32)
                                 * node->src[0]->ne[0]*node->src[0]->ne[1]
-                                * node->src[1]->ne[2]*node->src[1]->ne[3];
+                                * node->src[1]->ne[2]*node->src[1]->ne[3]
+#if defined(__AVX512BF16__) && defined(__AVX512VL__)
+                                + ggml_type_size(GGML_TYPE_F32) / 2
+                                * node->src[0]->ne[0]*node->src[0]->ne[1]
+                                * node->src[1]->ne[2]*node->src[1]->ne[3]
+                                + ggml_type_size(GGML_TYPE_F32) / 2
+                                * node->src[1]->ne[0]*node->src[1]->ne[1]
+                                * node->src[1]->ne[2]*node->src[1]->ne[3]
+#endif
+                                ;
                         }
                     } else
 #endif
@@ -20065,6 +20131,14 @@ int ggml_cpu_has_avx512_vbmi(void) {
 
 int ggml_cpu_has_avx512_vnni(void) {
 #if defined(__AVX512VNNI__)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int ggml_cpu_has_avx512_bf16(void) {
+#if defined(__AVX512BF16__) && defined(__AVX512VL__)
     return 1;
 #else
     return 0;

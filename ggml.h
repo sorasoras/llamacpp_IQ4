@@ -322,6 +322,9 @@ extern "C" {
 #else
     typedef uint16_t ggml_fp16_t;
 #endif
+#if defined(__AVX512BF16__) && defined(__AVX512VL__)
+    typedef __bf16 ggml_bf16_t;
+#endif
 
     // convert FP16 <-> FP32
     GGML_API float       ggml_fp16_to_fp32(ggml_fp16_t x);
@@ -329,6 +332,9 @@ extern "C" {
 
     GGML_API void ggml_fp16_to_fp32_row(const ggml_fp16_t * x, float * y, int n);
     GGML_API void ggml_fp32_to_fp16_row(const float * x, ggml_fp16_t * y, int n);
+#if defined(__AVX512BF16__) && defined(__AVX512VL__)
+    GGML_API void ggml_fp32_to_bf16_row(const float * x, ggml_bf16_t * y, int n);
+#endif
 
     struct ggml_object;
     struct ggml_context;
@@ -2230,6 +2236,7 @@ extern "C" {
     GGML_API int ggml_cpu_has_avx512     (void);
     GGML_API int ggml_cpu_has_avx512_vbmi(void);
     GGML_API int ggml_cpu_has_avx512_vnni(void);
+    GGML_API int ggml_cpu_has_avx512_bf16(void);
     GGML_API int ggml_cpu_has_fma        (void);
     GGML_API int ggml_cpu_has_neon       (void);
     GGML_API int ggml_cpu_has_arm_fma    (void);
