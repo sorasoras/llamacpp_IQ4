@@ -6281,15 +6281,6 @@ static int llama_decode_internal(
 
     // LLAMA_LOG_INFO("graph build time: %.3f ms (%d nodes, %d leafs)\n", (ggml_time_us() - t_start_us)/1000.0, gf->n_nodes, gf->n_leafs);
 
-    // for big prompts, if BLAS is enabled, it is better to use only one thread
-    // otherwise, the threads are spin-lock waiting for the BLAS calls and are degrading the performance
-    // TODO: this is mostly important for Apple Silicon where CBLAS is still performing very well
-    //       we still need some threads to process all non-mul_mat ops, but not too much to avoid interfering
-    //       with the BLAS calls. need a better solution
-    if (n_tokens >= 32 && ggml_cpu_has_blas() && !ggml_cpu_has_gpublas()) {
-        n_threads = std::min(4, n_threads);
-    }
-
     const bool fully_offloaded = model.n_gpu_layers >= (int) hparams.n_layer + 1;
     if (ggml_cpu_has_cublas() && fully_offloaded) {
         n_threads = 1;
