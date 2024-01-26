@@ -19,7 +19,11 @@
 
 #if defined(GGML_USE_HIPBLAS)
 #include <hip/hip_runtime.h>
+#ifdef __HIP_PLATFORM_SPIRV__
+#include <hipblas.h>
+#else
 #include <hipblas/hipblas.h>
+#endif
 #include <hip/hip_fp16.h>
 #ifdef __HIP_PLATFORM_AMD__
 // for rocblas_initialize()
@@ -629,10 +633,11 @@ static __device__ __forceinline__ float2 warp_reduce_sum(float2 a) {
 
 static __device__ __forceinline__ half2 warp_reduce_sum(half2 a) {
 #if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) && __CUDA_ARCH__ >= CC_PASCAL
-#pragma unroll
-    for (int mask = 16; mask > 0; mask >>= 1) {
-        a = __hadd2(a, __shfl_xor_sync(0xffffffff, a, mask, 32));
-    }
+    NO_DEVICE_CODE;
+// #pragma unroll
+//     for (int mask = 16; mask > 0; mask >>= 1) {
+//         a = __hadd2(a, __shfl_xor_sync(0xffffffff, a, mask, 32));
+//     }
     return a;
 #else
     (void) a;
@@ -7750,6 +7755,25 @@ GGML_CALL void ggml_cuda_host_free(void * ptr) {
     CUDA_CHECK(cudaFreeHost(ptr));
 }
 
+static __global__ void dkrnMemcpy2D(char * dst, const int64_t dpitch, const char * src, const int64_t spitch, const int64_t width, const int64_t height) {
+    const int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t j = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i < width && j < height) {
+        const char * s = src + j*spitch + i;
+        char * d = dst + j*dpitch + i;
+        *d = *s;
+    }
+}
+
+static cudaError_t krnMemcpy2D(char * dst, const int64_t dpitch, const char * src, const int64_t spitch, const int64_t width, const int64_t height) {
+    const int64_t block_size = 32;
+    const dim3 block_dims(block_size, block_size, 1);
+    const dim3 block_nums((width + block_size - 1) / block_size, (height + block_size - 1) / block_size, 1);
+    dkrnMemcpy2D<<<block_nums, block_dims>>>(dst, dpitch, src, spitch, width, height);
+    cudaDeviceSynchronize();
+    return cudaGetLastError();
+}
+
 static cudaError_t ggml_cuda_cpy_tensor_2d(
     void * dst, const struct ggml_tensor * src, int64_t i3, int64_t i2, int64_t i1_low, int64_t i1_high, cudaStream_t stream) {
 
@@ -7782,10 +7806,24 @@ static cudaError_t ggml_cuda_cpy_tensor_2d(
 
     const char * x = src_ptr + i1_low*nb1 + i2*nb2 + i3*nb3;
     if (nb0 == ts && nb1 == ts*ne0/bs) {
+        // printf("cudaMemcpyAsync ne0=%ld, nb0=%ld, nb1=%ld, nb2=%ld, nb3=%ld, type=%d, ts=%ld, bs=%ld, i1_diff=%ld\n",
+        //     ne0, nb0, nb1, nb2, nb3, type, ts, bs, i1_diff);
         return cudaMemcpyAsync(dst_ptr, x, i1_diff*nb1, kind, stream);
     } else if (nb0 == ts) {
-        return cudaMemcpy2DAsync(dst_ptr, ts*ne0/bs, x, nb1, ts*ne0/bs, i1_diff, kind, stream);
+        // printf("cudaMemcpy2DAsync ne0=%ld, nb0=%ld, nb1=%ld, nb2=%ld, nb3=%ld, type=%d, ts=%ld, bs=%ld, i1_diff=%ld\n",
+        //     ne0, nb0, nb1, nb2, nb3, type, ts, bs, i1_diff);
+        // printf("dst_ptr=%p, dpitch=%ld, src_ptr=%p, spitch=%ld, width=%ld, height=%ld\n",
+        //     dst_ptr, ts*ne0/bs, x, nb1, ts*ne0/bs, i1_diff);
+        if (kind == cudaMemcpyDeviceToDevice) {
+            // printf("using krnMemcpy2D\n");
+            return krnMemcpy2D(dst_ptr, ts*ne0/bs, x, nb1, ts*ne0/bs, i1_diff);
+        }
+        else {
+            return cudaMemcpy2DAsync(dst_ptr, ts*ne0/bs, x, nb1, ts*ne0/bs, i1_diff, kind, stream);
+        }
     } else {
+        // printf("LPcudaMemcpy2DAsync ne0=%ld, nb0=%ld, nb1=%ld, nb2=%ld, nb3=%ld, type=%d, ts=%ld, bs=%ld, i1_diff=%ld\n",
+        //     ne0, nb0, nb1, nb2, nb3, type, ts, bs, i1_diff);
         for (int64_t i1 = 0; i1 < i1_diff; i1++) {
             const void * rx = (const void *) ((const char *) x + i1*nb1);
             void * rd = (void *) (dst_ptr + i1*ts*ne0/bs);
@@ -9366,6 +9404,7 @@ static __global__ void k_compute_batched_ptrs(
     ptrs_dst[0*ne23 + i12 + i13*ne12] = (      char *)         dst + i12*nbd2 + i13*nbd3;
 }
 
+#if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_SPIRV__))
 static void ggml_cuda_mul_mat_mat_batched_cublas(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(!ggml_is_transposed(src0));
     GGML_ASSERT(!ggml_is_transposed(src1));
@@ -9513,6 +9552,7 @@ static void ggml_cuda_mul_mat_mat_batched_cublas(const ggml_tensor * src0, const
         to_fp32_cuda(dst_f16.get(), dst_ddf, ne_dst, main_stream);
     }
 }
+#endif
 
 static void ggml_cuda_mul_mat(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const bool all_on_device =
@@ -9572,9 +9612,11 @@ static void ggml_cuda_mul_mat(const ggml_tensor * src0, const ggml_tensor * src1
     } else if (!split && all_on_device && !fp16_performance_good && src0->type == GGML_TYPE_F16 && !ggml_is_contiguous(src0) && !ggml_is_transposed(src1) && src1->ne[1] == 1) {
         // KQV single-batch
         ggml_cuda_mul_mat_vec_nc(src0, src1, dst);
+#if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_SPIRV__))
     } else if (!split && all_on_device && fp16_performance_good && src0->type == GGML_TYPE_F16 && !ggml_is_transposed(src0) && !ggml_is_transposed(src1) && src1->ne[2]*src1->ne[3] > 1) {
         // KQ + KQV multi-batch
         ggml_cuda_mul_mat_mat_batched_cublas(src0, src1, dst);
+#endif
     } else if (src0->type == GGML_TYPE_F32) {
         ggml_cuda_op_mul_mat(src0, src1, dst, ggml_cuda_op_mul_mat_cublas, false);
     } else if (ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_F16) {
